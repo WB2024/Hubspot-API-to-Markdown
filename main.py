@@ -4,11 +4,10 @@ HubSpot API Documentation Scraper TUI
 Scrapes developers.hubspot.com documentation and stores it as Markdown files.
 """
 
-import os
+import argparse
 import sys
 import time
 import json
-import hashlib
 import requests
 import html2text
 import questionary
@@ -35,8 +34,10 @@ SITEMAP_URLS = [
 
 BASE_URL = "https://developers.hubspot.com"
 STATE_FILE = ".hubspot_docs_state.json"
+CONFIG_FILE = Path.home() / ".hubspot-docs-scraper.json"
 REQUEST_DELAY = 0.4  # seconds between requests (be polite)
 REQUEST_TIMEOUT = 20
+MAX_RETRIES = 3
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (compatible; HubSpotDocsScraper/1.0; "
@@ -45,6 +46,9 @@ HEADERS = {
 }
 
 console = Console()
+
+# Session cache for sitemap (avoid re-fetching during a single run)
+_sitemap_cache: list[dict] | None = None
 
 
 # ─── State Management ─────────────────────────────────────────────────────────
@@ -67,6 +71,46 @@ def save_state(output_dir: Path, state: dict) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
+
+
+# ─── Config Management ────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    """Load user configuration from home directory."""
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+    return {}
+
+
+def save_config(config: dict) -> None:
+    """Save user configuration to home directory."""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+    except IOError as e:
+        console.print(f"[yellow]  Warning: Could not save config: {e}[/yellow]")
+
+
+def get_output_dir_from_config() -> Path | None:
+    """Get saved output directory from config, if it exists."""
+    config = load_config()
+    if "output_dir" in config:
+        path = Path(config["output_dir"]).expanduser().resolve()
+        if path.exists():
+            return path
+    return None
+
+
+def save_output_dir_to_config(output_dir: Path) -> None:
+    """Save output directory to config for future sessions."""
+    config = load_config()
+    config["output_dir"] = str(output_dir)
+    config["last_used"] = datetime.now(timezone.utc).isoformat()
+    save_config(config)
 
 
 # ─── Sitemap Fetching ─────────────────────────────────────────────────────────
@@ -113,19 +157,40 @@ def fetch_sitemap_entries(sitemap_url: str) -> list[dict]:
     return entries
 
 
-def discover_all_pages() -> list[dict]:
-    """Fetch all sitemap entries and filter to docs pages only."""
-    all_entries = []
-    with console.status("[bold cyan]Fetching sitemaps…[/bold cyan]"):
-        for sitemap_url in SITEMAP_URLS:
-            entries = fetch_sitemap_entries(sitemap_url)
-            all_entries.extend(entries)
+def discover_all_pages(version_filter: str | None = None, use_cache: bool = True) -> list[dict]:
+    """
+    Fetch all sitemap entries and filter to docs pages only.
+    
+    Args:
+        version_filter: Optional API version to filter (e.g., 'latest', '2026-09-beta')
+        use_cache: Whether to use cached sitemap from this session
+    """
+    global _sitemap_cache
+    
+    if use_cache and _sitemap_cache is not None:
+        all_entries = _sitemap_cache
+    else:
+        all_entries = []
+        with console.status("[bold cyan]Fetching sitemaps…[/bold cyan]"):
+            for sitemap_url in SITEMAP_URLS:
+                entries = fetch_sitemap_entries(sitemap_url)
+                all_entries.extend(entries)
+        _sitemap_cache = all_entries
 
     # Filter to developers.hubspot.com/docs pages only
     docs_entries = [
         e for e in all_entries
         if BASE_URL in e["url"] and "/docs" in e["url"]
     ]
+    
+    # Apply version filter if specified
+    if version_filter:
+        docs_entries = [
+            e for e in docs_entries
+            if f"/api-reference/{version_filter}/" in e["url"]
+            or "/guides/" in e["url"]  # Always include guides
+            or "/api-reference/" not in e["url"]  # Include non-API-reference pages
+        ]
 
     # Deduplicate
     seen = set()
@@ -136,6 +201,12 @@ def discover_all_pages() -> list[dict]:
             unique.append(e)
 
     return unique
+
+
+def clear_sitemap_cache() -> None:
+    """Clear the sitemap cache to force a fresh fetch."""
+    global _sitemap_cache
+    _sitemap_cache = None
 
 
 # ─── URL → File Path Mapping ──────────────────────────────────────────────────
@@ -169,16 +240,30 @@ def url_to_filepath(url: str, output_dir: Path) -> Path:
 
 # ─── Page Scraping ────────────────────────────────────────────────────────────
 
-def scrape_page_to_markdown(url: str) -> Optional[str]:
+def scrape_page_to_markdown(url: str, retries: int = MAX_RETRIES) -> Optional[str]:
     """
     Download a HubSpot docs page and convert it to clean Markdown,
     preserving all code blocks.
+    
+    Args:
+        url: The page URL to scrape
+        retries: Number of retry attempts for failed requests
     """
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        console.print(f"[red]    ✗ Request failed for {url}: {e}[/red]")
+    last_error = None
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            break
+        except requests.RequestException as e:
+            last_error = e
+            if attempt < retries - 1:
+                time.sleep(1 * (attempt + 1))  # Exponential backoff
+                continue
+            console.print(f"[red]    ✗ Request failed for {url} after {retries} attempts: {e}[/red]")
+            return None
+    else:
+        console.print(f"[red]    ✗ Request failed for {url}: {last_error}[/red]")
         return None
 
     soup = BeautifulSoup(resp.text, "lxml")
@@ -312,9 +397,28 @@ def download_page(entry: dict, output_dir: Path, state: dict) -> bool:
 
 # ─── TUI Actions ──────────────────────────────────────────────────────────────
 
-def prompt_output_dir() -> Path:
-    """Prompt user for the markdown output directory."""
-    default = str(Path.home() / "hubspot-docs")
+def prompt_output_dir(use_saved: bool = True) -> Path:
+    """
+    Prompt user for the markdown output directory.
+    
+    Args:
+        use_saved: If True, offer to use the previously saved directory
+    """
+    # Check for saved directory
+    saved_dir = get_output_dir_from_config()
+    
+    if use_saved and saved_dir:
+        use_saved_choice = questionary.confirm(
+            f"📁  Use saved directory? ({saved_dir})",
+            default=True,
+        ).ask()
+        if use_saved_choice is None:
+            console.print("[yellow]Cancelled.[/yellow]")
+            sys.exit(0)
+        if use_saved_choice:
+            return saved_dir
+    
+    default = str(saved_dir) if saved_dir else str(Path.home() / "hubspot-docs")
     answer = questionary.text(
         "📁  Where should Markdown files be stored?",
         default=default,
@@ -323,7 +427,13 @@ def prompt_output_dir() -> Path:
     if answer is None:
         console.print("[yellow]Cancelled.[/yellow]")
         sys.exit(0)
-    return Path(answer.strip()).expanduser().resolve()
+    
+    output_dir = Path(answer.strip()).expanduser().resolve()
+    
+    # Save for future sessions
+    save_output_dir_to_config(output_dir)
+    
+    return output_dir
 
 
 def action_download_missing(output_dir: Path) -> None:
@@ -601,7 +711,22 @@ def action_show_status(output_dir: Path) -> None:
 
 def action_change_directory() -> Path:
     """Prompt the user to change the output directory."""
-    return prompt_output_dir()
+    return prompt_output_dir(use_saved=False)
+
+
+def action_clear_config() -> None:
+    """Clear the saved configuration."""
+    if CONFIG_FILE.exists():
+        CONFIG_FILE.unlink()
+        console.print("[green]  ✓ Configuration cleared.[/green]")
+    else:
+        console.print("[yellow]  No configuration file found.[/yellow]")
+
+
+def action_refresh_sitemap() -> None:
+    """Force refresh the sitemap cache."""
+    clear_sitemap_cache()
+    console.print("[green]  ✓ Sitemap cache cleared. Will re-fetch on next action.[/green]")
 
 
 # ─── Main Menu ────────────────────────────────────────────────────────────────
@@ -611,7 +736,10 @@ MENU_CHOICES = [
     questionary.Choice("🔄  Check for & download updates", "updates"),
     questionary.Choice("🎯  Download specific section",    "specific"),
     questionary.Choice("📊  Show status",                  "status"),
+    questionary.Separator(),
     questionary.Choice("📁  Change output directory",      "change_dir"),
+    questionary.Choice("🔃  Refresh sitemap cache",        "refresh"),
+    questionary.Choice("🗑️   Clear saved settings",         "clear_config"),
     questionary.Separator(),
     questionary.Choice("🚪  Quit",                         "quit"),
 ]
@@ -629,16 +757,92 @@ def print_banner() -> None:
     )
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Scrape HubSpot API documentation to Markdown files.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py                        # Interactive TUI mode
+  python main.py --download             # Download all missing pages (non-interactive)
+  python main.py --status               # Show download status
+  python main.py --output ~/my-docs     # Use specific output directory
+  python main.py --download --output .  # Download to current directory
+        """
+    )
+    parser.add_argument(
+        "-o", "--output",
+        type=str,
+        metavar="DIR",
+        help="Output directory for Markdown files (saves as default for future runs)"
+    )
+    parser.add_argument(
+        "-d", "--download",
+        action="store_true",
+        help="Download all missing pages (non-interactive mode)"
+    )
+    parser.add_argument(
+        "-u", "--update",
+        action="store_true",
+        help="Check for and download updated pages (non-interactive mode)"
+    )
+    parser.add_argument(
+        "-s", "--status",
+        action="store_true",
+        help="Show download status and exit"
+    )
+    parser.add_argument(
+        "--clear-config",
+        action="store_true",
+        help="Clear saved configuration and exit"
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    
+    # Handle --clear-config
+    if args.clear_config:
+        action_clear_config()
+        return
+    
     print_banner()
     console.print()
-
-    output_dir = prompt_output_dir()
+    
+    # Determine output directory
+    if args.output:
+        output_dir = Path(args.output).expanduser().resolve()
+        save_output_dir_to_config(output_dir)
+    elif args.download or args.update or args.status:
+        # Non-interactive mode: use saved dir or fail
+        output_dir = get_output_dir_from_config()
+        if not output_dir:
+            console.print("[red]Error: No saved output directory. Run interactively first or use --output.[/red]")
+            sys.exit(1)
+    else:
+        output_dir = prompt_output_dir()
+    
     output_dir.mkdir(parents=True, exist_ok=True)
     console.print(
         f"  Using output directory: [bold cyan]{output_dir}[/bold cyan]\n"
     )
+    
+    # Non-interactive modes
+    if args.status:
+        action_show_status(output_dir)
+        return
+    
+    if args.download:
+        action_download_missing(output_dir)
+        return
+    
+    if args.update:
+        action_check_updates(output_dir)
+        return
 
+    # Interactive TUI mode
     while True:
         choice = questionary.select(
             "  What would you like to do?",
@@ -662,6 +866,10 @@ def main() -> None:
             console.print(
                 f"  Switched to: [bold cyan]{output_dir}[/bold cyan]\n"
             )
+        elif choice == "refresh":
+            action_refresh_sitemap()
+        elif choice == "clear_config":
+            action_clear_config()
 
         console.print()
 
