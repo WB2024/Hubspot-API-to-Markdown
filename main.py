@@ -29,7 +29,8 @@ from rich import box
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 SITEMAP_URLS = [
-    "https://developers.hubspot.com/sitemap.xml",
+    "https://developers.hubspot.com/docs/sitemap.xml",  # Main docs sitemap (API reference, guides)
+    "https://developers.hubspot.com/sitemap.xml",       # General sitemap (changelog, blog - filtered to /docs only)
 ]
 
 BASE_URL = "https://developers.hubspot.com"
