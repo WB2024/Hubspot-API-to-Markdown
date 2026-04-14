@@ -184,6 +184,7 @@ def scrape_page_to_markdown(url: str) -> Optional[str]:
 
     # ── Try to extract the main documentation content ──
     # HubSpot docs use several possible container selectors; try them in order.
+    # The new Mintlify-based docs use Tailwind classes; find the content area.
     content = (
         soup.find("main")
         or soup.find("article")
@@ -191,8 +192,17 @@ def scrape_page_to_markdown(url: str) -> Optional[str]:
         or soup.find(class_="developer-docs__content")
         or soup.find(class_="docs-content")
         or soup.find(class_="content")
-        or soup.body
     )
+    
+    # For Mintlify/Tailwind-based HubSpot docs: find the largest px-5 div (main content area)
+    if content is None:
+        px5_divs = soup.find_all("div", class_="px-5")
+        if px5_divs:
+            content = max(px5_divs, key=lambda d: len(d.get_text()))
+    
+    # Fallback to body
+    if content is None:
+        content = soup.body
 
     if content is None:
         return None
@@ -202,10 +212,27 @@ def scrape_page_to_markdown(url: str) -> Optional[str]:
         ["nav", "footer", "header", "aside", "script", "style", "noscript"]
     ):
         tag.decompose()
-    for tag in content.find_all(class_=lambda c: c and any(
-        kw in c for kw in ["sidebar", "nav", "menu", "breadcrumb", "footer",
-                            "header", "toc", "cookie", "banner", "feedback"]
-    )):
+    
+    # Keywords that indicate non-content elements
+    # Match only if keyword is the class name or appears at the start (e.g., "nav-item")
+    # Avoid matching Tailwind utility classes like "pt-[calc(9rem+var(--banner-height,0px))]"
+    def is_nav_class(class_list):
+        if not class_list:
+            return False
+        keywords = ["sidebar", "nav", "menu", "breadcrumb", "footer",
+                    "header", "toc", "cookie", "banner", "feedback"]
+        for cls in class_list:
+            cls_lower = cls.lower()
+            for kw in keywords:
+                # Match: exact keyword, keyword at start, or keyword after common prefixes
+                if cls_lower == kw or cls_lower.startswith(kw + "-") or cls_lower.startswith(kw + "_"):
+                    return True
+                # Also match if keyword appears after a hyphen (e.g., "site-nav", "page-header")
+                if f"-{kw}" in cls_lower and not cls_lower.startswith("pt-") and not cls_lower.startswith("var("):
+                    return True
+        return False
+    
+    for tag in content.find_all(class_=is_nav_class):
         tag.decompose()
 
     # ── Pre-process code blocks so html2text preserves them ──
