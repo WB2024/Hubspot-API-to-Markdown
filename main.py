@@ -5,6 +5,7 @@ Scrapes developers.hubspot.com documentation and stores it as Markdown files.
 """
 
 import argparse
+import re
 import sys
 import time
 import json
@@ -35,9 +36,9 @@ SITEMAP_URLS = [
 BASE_URL = "https://developers.hubspot.com"
 STATE_FILE = ".hubspot_docs_state.json"
 CONFIG_FILE = Path.home() / ".hubspot-docs-scraper.json"
-REQUEST_DELAY = 0.4  # seconds between requests (be polite)
-REQUEST_TIMEOUT = 20
-MAX_RETRIES = 3
+REQUEST_DELAY = 0.5  # seconds between requests (be polite)
+REQUEST_TIMEOUT = 45  # longer timeout for slow pages
+MAX_RETRIES = 5       # more retries for flaky connections
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (compatible; HubSpotDocsScraper/1.0; "
@@ -252,18 +253,24 @@ def scrape_page_to_markdown(url: str, retries: int = MAX_RETRIES) -> Optional[st
     last_error = None
     for attempt in range(retries):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            # Use longer timeout for retries
+            timeout = REQUEST_TIMEOUT + (attempt * 15)
+            resp = requests.get(url, headers=HEADERS, timeout=timeout)
             resp.raise_for_status()
             break
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            if attempt < retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4, 8, 16s
+                time.sleep(wait_time)
+                continue
         except requests.RequestException as e:
             last_error = e
             if attempt < retries - 1:
-                time.sleep(1 * (attempt + 1))  # Exponential backoff
+                time.sleep(1 * (attempt + 1))
                 continue
-            console.print(f"[red]    ✗ Request failed for {url} after {retries} attempts: {e}[/red]")
-            return None
     else:
-        console.print(f"[red]    ✗ Request failed for {url}: {last_error}[/red]")
+        console.print(f"[red]    ✗ Request failed for {url} after {retries} attempts: {last_error}[/red]")
         return None
 
     soup = BeautifulSoup(resp.text, "lxml")
@@ -295,9 +302,38 @@ def scrape_page_to_markdown(url: str, retries: int = MAX_RETRIES) -> Optional[st
 
     # ── Remove navigation, headers, footers, sidebars ──
     for tag in content.find_all(
-        ["nav", "footer", "header", "aside", "script", "style", "noscript"]
+        ["nav", "footer", "header", "aside", "script", "style", "noscript", "svg", "iframe"]
     ):
         tag.decompose()
+    
+    # ── Remove interactive UI elements that don't make sense in static markdown ──
+    # Remove buttons and interactive elements
+    for tag in content.find_all(["button", "input", "select", "form"]):
+        tag.decompose()
+    
+    # Remove elements with interactive/UI text
+    interactive_texts = [
+        "Show child attributes", "Hide child attributes",
+        "Try it", "Copy", "Copied",
+        "Yes", "No",  # Feedback buttons
+        "Was this page helpful?",
+        "Navigate to header",
+    ]
+    for text in interactive_texts:
+        for tag in content.find_all(string=re.compile(re.escape(text), re.IGNORECASE)):
+            parent = tag.parent
+            if parent and parent.name in ["button", "span", "div", "a"]:
+                # Check if it's a small UI element (not main content)
+                if len(parent.get_text()) < 50:
+                    parent.decompose()
+    
+    # Remove duplicate API panels - keep only the main content, not the sticky sidebar
+    # The API docs show the same curl/response in two places
+    sticky_panels = content.find_all("div", class_=lambda c: c and "sticky" in str(c))
+    for panel in sticky_panels:
+        # Only remove if it looks like a duplicate code panel
+        if panel.find("pre") and len(panel.get_text()) < 5000:
+            panel.decompose()
     
     # Keywords that indicate non-content elements
     # Match only if keyword is the class name or appears at the start (e.g., "nav-item")
@@ -335,28 +371,45 @@ def scrape_page_to_markdown(url: str, retries: int = MAX_RETRIES) -> Optional[st
             code_text = code_el.get_text()
         else:
             code_text = pre.get_text()
+        
+        # Auto-detect language if not found
+        if not lang:
+            code_stripped = code_text.strip()
+            if code_stripped.startswith("curl ") or code_stripped.startswith("curl\n"):
+                lang = "bash"
+            elif code_stripped.startswith("{") or code_stripped.startswith("["):
+                lang = "json"
+            elif "import " in code_stripped[:100] or "from " in code_stripped[:100]:
+                lang = "python"
+            elif "const " in code_stripped[:100] or "function " in code_stripped[:100]:
+                lang = "javascript"
 
-        fence = f"```{lang}\n{code_text}\n```"
-        new_tag = soup.new_tag("p")
+        fence = f"\n```{lang}\n{code_text.strip()}\n```\n"
+        new_tag = soup.new_tag("div")
         new_tag.string = fence
         pre.replace_with(new_tag)
 
     # ── Convert to Markdown ──
     converter = html2text.HTML2Text()
     converter.ignore_links = False
-    converter.ignore_images = False
+    converter.ignore_images = True  # Ignore images (usually icons)
     converter.body_width = 0          # don't wrap lines
     converter.protect_links = True
     converter.wrap_links = False
     converter.mark_code = True
+    converter.ignore_emphasis = False
 
     raw_md = converter.handle(str(content))
+    
+    # ── Post-process markdown cleanup ──
+    raw_md = clean_markdown(raw_md)
 
     # ── Add page header ──
     title_el = soup.find("title")
     title = title_el.get_text().strip() if title_el else url
     # Clean up common HubSpot title suffix
     title = title.replace(" | HubSpot Developer Docs", "").strip()
+    title = title.replace(" - HubSpot docs", "").strip()
 
     header = (
         f"# {title}\n\n"
@@ -368,7 +421,70 @@ def scrape_page_to_markdown(url: str, retries: int = MAX_RETRIES) -> Optional[st
     return header + raw_md
 
 
-# ─── Download Logic ───────────────────────────────────────���───────────────────
+def clean_markdown(md: str) -> str:
+    """Clean up and format the markdown output."""
+    
+    # Remove zero-width spaces and other invisible unicode
+    md = md.replace("\u200b", "")  # Zero-width space
+    md = md.replace("\u200c", "")  # Zero-width non-joiner
+    md = md.replace("\u200d", "")  # Zero-width joiner
+    md = md.replace("\ufeff", "")  # BOM
+    md = md.replace("\u00a0", " ")  # Non-breaking space -> regular space
+    
+    # Remove "Show child attributes" and similar UI text that might have slipped through
+    ui_patterns = [
+        r"Show child attributes\s*",
+        r"Hide child attributes\s*",
+        r"Navigate to header\s*",
+        r"Was this page helpful\?\s*",
+        r"Last modified on [A-Za-z]+ \d+, \d+\s*",
+        r"⌘[A-Z]\s*",  # Keyboard shortcuts like ⌘I
+    ]
+    for pattern in ui_patterns:
+        md = re.sub(pattern, "", md, flags=re.IGNORECASE)
+    
+    # Fix code blocks that got mangled
+    # Remove backslashes before dashes in code blocks (curl \--url -> curl --url)
+    def fix_code_block(match):
+        code = match.group(0)
+        code = code.replace("\\--", "--")
+        code = code.replace("\\ --", " --")
+        return code
+    
+    md = re.sub(r"```[\s\S]*?```", fix_code_block, md)
+    
+    # Remove duplicate blank lines (more than 2 newlines -> 2)
+    md = re.sub(r"\n{4,}", "\n\n\n", md)
+    
+    # Remove lines that are just whitespace
+    md = re.sub(r"\n[ \t]+\n", "\n\n", md)
+    
+    # Clean up bullet points
+    md = re.sub(r"^\s*\*\s+\*\s+", "  * ", md, flags=re.MULTILINE)
+    
+    # Remove orphaned list markers
+    md = re.sub(r"^\s*\*\s*$", "", md, flags=re.MULTILINE)
+    
+    # Fix headers that might have extra spaces
+    md = re.sub(r"^(#{1,6})\s{2,}", r"\1 ", md, flags=re.MULTILINE)
+    
+    # Remove "Option 1", "Option 2" type selectors (UI tabs)
+    md = re.sub(r"^\s*\*\s*Option \d+\s*$", "", md, flags=re.MULTILINE)
+    
+    # Clean up HubSpot-specific UI remnants
+    md = re.sub(r"oauth2private_appsoauth2private_apps", "OAuth 2.0 / Private Apps", md)
+    md = re.sub(r"YesNo\s*$", "", md, flags=re.MULTILINE)
+    
+    # Remove lines that are just emojis or icons
+    md = re.sub(r"^[^\w\n]*$", "", md, flags=re.MULTILINE)
+    
+    # Final cleanup of excessive newlines
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    
+    return md.strip()
+
+
+# ─── Download Logic ──────────────────────────────────────────────────────────
 
 def download_page(entry: dict, output_dir: Path, state: dict) -> bool:
     """Download a single page and save it. Returns True on success."""

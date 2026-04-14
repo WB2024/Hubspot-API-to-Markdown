@@ -187,10 +187,15 @@ To reset: `python main.py --clear-config`
 Edit constants at the top of `main.py`:
 
 ```python
-REQUEST_DELAY = 0.4   # Seconds between requests (be polite)
-REQUEST_TIMEOUT = 20  # Request timeout in seconds
-MAX_RETRIES = 3       # Retry attempts for failed requests
+REQUEST_DELAY = 0.5   # Seconds between requests (be polite)
+REQUEST_TIMEOUT = 45  # Initial request timeout in seconds (increases on retry)
+MAX_RETRIES = 5       # Retry attempts for failed/timeout requests
 ```
+
+**Retry behavior:**
+- Timeouts automatically retry up to 5 times with exponential backoff
+- Timeout increases by 15 seconds each retry (45s → 60s → 75s → ...)
+- Other errors retry with linear backoff
 
 ## Requirements
 
